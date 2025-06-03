@@ -1,2 +1,2 @@
-# paskaruutta
+# Paskaruutta
 Paksaruutta documentation
