@@ -1,0 +1,202 @@
+//***********************************************************
+//*  Robot Joint Driver by Juha Koljonen                    *
+//*  Takes 100*deg/s for each axis (will divide on rx event)*
+//*  Reports 100*deg for each axis (multiplies before send) *
+//***********************************************************
+
+//#include <Servo.h>
+#include <AccelStepper.h>
+#define teensyLEDPin 13
+#define j0enablePin 2
+#define j0stepPin 1
+#define j0dirPin 0
+#define j0faultPin 3
+#define j1qaPin 14
+#define j1qbPin 15
+#define j1drive0Pin 23
+#define j1drive1Pin 22
+#define j2qaPin 16
+#define j2qbPin 17
+//#define j3Pin x
+#define j0scaler 32.0*400.0*110.0/(360.0*23.0)
+#define j1scaler 2*(512.0/360.0)
+#define j2scaler 1
+#define j3scaler 1
+
+#define j1VelocityKp 1
+#define j2VelocityKp 1
+#define j3VelocityKp 1
+
+// Joint state control
+AccelStepper joint0(1, j0stepPin, j0dirPin); 
+//Servo joint3;
+boolean j0fault = false;
+// Setpoints are in deg/s
+float j0sp = 0.0;
+float j1sp = 0.0;
+float j2sp = 0.0;
+float j3sp = 0.0;
+// Positions are in quadrature tics
+volatile int j1pos = 0;
+volatile int j2pos = 0;
+int j3pos = 0;
+int lastj1pos = 0;
+int lastj2pos = 0;
+int lastj3pos = 0;
+// Velocity is in deg/s
+float j1vel = 0.0;
+float j2vel = 0.0;
+float j3vel = 0.0;
+float j1err = 0.0;
+
+// General robot state control
+boolean stringComplete = false;
+byte bufferLength = 0;
+void enableMotors(void);
+void disableMotors(void);
+void disableJoints(void);
+boolean motorsEnabled = false;
+long lastUpdateTime = 0;
+
+void setup() {
+  pinMode(j0faultPin, INPUT);
+  pinMode(j0enablePin, OUTPUT);
+  pinMode(j1drive0Pin, OUTPUT);
+  pinMode(j1drive1Pin, OUTPUT);
+  pinMode(j1qaPin, INPUT);
+  pinMode(j1qbPin, INPUT);
+  pinMode(j2qaPin, INPUT);
+  pinMode(j2qbPin, INPUT);
+  pinMode(teensyLEDPin, OUTPUT);      // LED to show Teensy is alive
+  digitalWriteFast(teensyLEDPin, HIGH);
+  disableMotors();  
+  //joint3.attach(j3Pin, 544, 2400);   // Attach servo with 544-2400us ctrl range
+  
+  // ISR interrupt attachment, handled in ISR_functions file
+  attachInterrupt(j1qaPin, isrUpdateJ1ar, RISING);
+  attachInterrupt(j1qaPin, isrUpdateJ1af, FALLING);
+  attachInterrupt(j1qbPin, isrUpdateJ1br, RISING);
+  attachInterrupt(j1qbPin, isrUpdateJ1bf, FALLING);
+  attachInterrupt(j2qaPin, isrUpdateJ2ar, RISING);
+  attachInterrupt(j0faultPin, isrFaultJ0, FALLING);  
+  
+  joint0.setMaxSpeed(8000);
+  joint0.setAcceleration(10);
+  
+  Serial.begin(9600);
+  while (!Serial.dtr()) ;  // Wait for user to start the serial comms
+  
+  delay(250);
+  Serial.println("INFO: Initialization finished");
+  Serial.println("INFO: # Syntax #");
+  Serial.println("INFO: Control joint velocity (100*deg/s): Ax Bx Cx Dx");
+  Serial.println("INFO: Enable motors: T");
+  Serial.println("INFO: Disable motors: F");
+  Serial.println("INFO: Zero joint positions: Z");
+}
+
+void loop() {
+  // If input data is available, SerialComm file handles it and writes stringComplete
+  if (Serial.available()) serialRead();
+  
+  if (stringComplete) {
+    if (code_seen('F')) disableMotors();
+    else if (code_seen('T')) enableMotors();
+    else if (code_seen('Z')) zeroJoints();
+    else {
+      // Get joint velocity setpoints from received serial data
+      if (getBlock('A', j0sp)) {
+        // No need to constrain velocity, this is handled by AccelStepper lib
+        if (motorsEnabled) joint0.setSpeed(j0sp*j0scaler/100);
+      }
+    
+      if (getBlock('B', j1sp)) {
+        j1sp = constrain(j1sp/100, -60, 60);
+      }
+    
+      if (getBlock('C', j2sp)) {
+        j2sp = constrain(j2sp/100, -60, 60);
+      }
+      
+      if (getBlock('D', j3sp)) {
+       j3sp = constrain(j3sp/100, -60, 60);
+      }
+    }
+    // Got all we want, dump buffer
+    stringComplete = false;
+    bufferLength = 0; 
+  }
+  
+  if (micros() > (lastUpdateTime + 50000)) {
+    // Time in seconds = difference in microseconds / 1 000 000
+    int time = (micros() - lastUpdateTime)/1000000;
+    
+    // Joint velocity = distance from last update, scaled to deg, divided by time
+    j1vel = ((j1pos - lastj1pos) / j1scaler) / time;
+    j2vel = ((j2pos - lastj2pos) / j2scaler) / time;
+    
+    lastj1pos = j1pos;
+    lastj2pos = j2pos;
+    
+    lastUpdateTime = micros();
+    
+    if (motorsEnabled) {
+      driveJoint1Velocity();
+      // Do the inverse of j1 and j2 behavior, calculate pos setpoint from velocity
+      j3pos = constrain(j3pos+j3sp*time, -90, 90);
+   // driveJoint3Velocity();
+    }
+    
+    Serial.print(int(joint0.currentPosition()/j0scaler*100));
+    Serial.print("\t ");
+    Serial.print(int(j1pos/j1scaler*100));
+    Serial.print("\t ");
+    Serial.print(int(j2pos/j2scaler*100));
+    Serial.print("\t ");
+    Serial.println(int(j3pos/j3scaler*100));
+  }
+  
+  if (motorsEnabled) {
+    joint0.runSpeed();
+  }
+}
+
+void driveJoint1Velocity(void) {
+  // Drive joint 1 velocity deg/s
+  Serial.print("J1 velocity setpoint ");
+  float j1err = j1sp - j1vel;
+  Serial.println(j1err);
+  int effort = constrain(j1err*j1VelocityKp, -127, 127);
+  analogWrite(j1drive0Pin, 127+effort);
+  analogWrite(j1drive1Pin, 127-effort);
+}
+
+void driveJoint3Velocity() {
+  //joint3.write(j3pos);
+}
+
+void zeroJoints(void) {
+  joint0.setCurrentPosition(0);
+  j1pos = 0;
+  j2pos = 0;
+  j3pos = 0;
+}
+
+void enableMotors(void) {
+  // Enable joint 0 motor controller (required for operation)
+  digitalWrite(j0enablePin, LOW);
+  motorsEnabled = true;
+  Serial.println("INFO: motors enabled");
+}
+
+void disableMotors(void) {
+  // Disable drive immediately
+  joint0.setSpeed(0);
+  digitalWrite(j0enablePin, HIGH);
+  analogWrite(j1drive1Pin, 127);
+  analogWrite(j1drive0Pin, 127);
+  
+  motorsEnabled = false;
+  Serial.println("INFO: motors disabled");
+}
+
